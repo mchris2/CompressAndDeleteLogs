@@ -302,9 +302,16 @@ foreach ($file in $oldFiles) {
     
     try {
         Compress-Archive -Path $file.FullName -DestinationPath $zipFile -Force -ErrorAction Stop
+        
+        # Preserve the original file's timestamps on the zip file
+        $zipFileItem = Get-Item $zipFile
+        $zipFileItem.CreationTime = $file.CreationTime
+        $zipFileItem.LastWriteTime = $file.LastWriteTime
+        $zipFileItem.LastAccessTime = $file.LastAccessTime
+        
         $zipSize = (Get-Item $zipFile).Length
         $totalArchivedSize += $zipSize
-        Write-Log "Archived: $($file.FullName) -> $zipFile"
+        Write-Log "Archived: $($file.FullName) -> $zipFile (preserved timestamps)"
         
         if (-not $ArchiveOnly) {
             Remove-Item -Path $file.FullName -Force
