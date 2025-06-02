@@ -5,12 +5,13 @@
 .DESCRIPTION
     This script searches for log files older than a configurable retention period, compresses them into .zip archives,
     and deletes the originals (unless -ArchiveOnly is specified). It logs all actions and errors to a specified log file.
+    By default, archived files are stored in an 'Archive' subfolder within the same directory as the source file.
 
 .PARAMETER SourcePath
     The root directory to search for log files.
 
 .PARAMETER DestinationPath
-    The root directory where compressed files will be stored.
+    The root directory where compressed files will be stored. If not specified, uses 'Archive' subfolder in each source directory.
 
 .PARAMETER LogFilePath
     The path to the log file.
@@ -22,12 +23,15 @@
     If set, archives logs but does not delete the originals.
 
 .EXAMPLE
+    .\CompressAndDeleteLogs.ps1 -SourcePath "C:\inetpub\logs\LogFiles" -RetentionDays 30
+    
+.EXAMPLE
     .\CompressAndDeleteLogs.ps1 -SourcePath "C:\inetpub\logs\LogFiles" -DestinationPath "E:\Logs" -LogFilePath "D:\Scripts\CompressAndDeleteLogs.log" -RetentionDays 30
 #>
 
 param (
     [string]$SourcePath = "C:\inetpub\logs\LogFiles",
-    [string]$DestinationPath = "E:\Logs",
+    [string]$DestinationPath = "",
     [string]$LogFilePath = "$(Split-Path -Parent $MyInvocation.MyCommand.Path)\CompressAndDeleteLogs.log",
     [int]$RetentionDays = 30,
     [switch]$ArchiveOnly
@@ -130,6 +134,27 @@ function Get-FreeSpace {
     return $null
 }
 
+function Get-DestinationPath {
+    param (
+        [string]$SourceFilePath,
+        [string]$GlobalDestinationPath
+    )
+    if ([string]::IsNullOrWhiteSpace($GlobalDestinationPath)) {
+        # Use Archive subfolder in the same directory as the source file
+        $sourceDir = Split-Path -Parent $SourceFilePath
+        return Join-Path $sourceDir "Archive"
+    } else {
+        # Use the global destination path with preserved directory structure
+        $relativePath = $SourceFilePath.Substring($SourcePath.Length).TrimStart("\")
+        $relativeDir = Split-Path -Parent $relativePath
+        if ([string]::IsNullOrWhiteSpace($relativeDir)) {
+            return $GlobalDestinationPath
+        } else {
+            return Join-Path $GlobalDestinationPath $relativeDir
+        }
+    }
+}
+
 function Write-LogArchiveSummary {
     param (
         $filesToArchive,
@@ -199,10 +224,13 @@ if (-not (Test-Permissions -Path $SourcePath -Type "Read")) {
     Write-Host "ERROR: No read permission on $SourcePath"
     exit 1
 }
-if (-not (Test-Permissions -Path $DestinationPath -Type "ReadWrite")) {
+
+# Only check destination permissions if a global destination is specified
+if (-not [string]::IsNullOrWhiteSpace($DestinationPath) -and -not (Test-Permissions -Path $DestinationPath -Type "ReadWrite")) {
     Write-Host "ERROR: No write permission on $DestinationPath"
     exit 1
 }
+
 if (-not (Test-Permissions -Path (Split-Path $LogFilePath) -Type "ReadWrite")) {
     Write-Host "ERROR: No write permission for log file at $LogFilePath"
     exit 1
@@ -214,9 +242,13 @@ if (-not (Get-Command Compress-Archive -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
-Write-Log "Script started. Source: $SourcePath, Destination: $DestinationPath, Retention: $RetentionDays days"
+$destinationMode = if ([string]::IsNullOrWhiteSpace($DestinationPath)) { "Local Archive folders" } else { "Global destination: $DestinationPath" }
+Write-Log "Script started. Source: $SourcePath, Destination mode: $destinationMode, Retention: $RetentionDays days"
 
-Test-OrCreateDirectory $DestinationPath
+# Only create global destination if specified
+if (-not [string]::IsNullOrWhiteSpace($DestinationPath)) {
+    Test-OrCreateDirectory $DestinationPath
+}
 
 # Only write to the event log if the entire script fails (e.g., cannot enumerate files)
 try {
@@ -229,17 +261,16 @@ try {
     exit 1
 }
 
-# --- Combine directory creation for all needed destination directories ---
+# --- Create destination directories as needed ---
 $uniqueDirs = $oldFiles | ForEach-Object {
-    $relativePath = $_.DirectoryName.Substring($SourcePath.Length).TrimStart("\")
-    Join-Path $DestinationPath $relativePath
+    Get-DestinationPath -SourceFilePath $_.FullName -GlobalDestinationPath $DestinationPath
 } | Sort-Object -Unique
 
 foreach ($dir in $uniqueDirs) {
     Test-OrCreateDirectory $dir
 }
 
-# --- Archive files (jobs not needed for small numbers) ---
+# --- Archive files ---
 $filesToArchive = @()
 $filesSkipped = @()
 $jobErrors = @()
@@ -250,9 +281,9 @@ $failureCount = 0
 $freeSpaceBefore = Get-FreeSpace $SourcePath
 
 foreach ($file in $oldFiles) {
-    $relativePath = $file.DirectoryName.Substring($SourcePath.Length).TrimStart("\")
-    $destinationDir = Join-Path $DestinationPath $relativePath
+    $destinationDir = Get-DestinationPath -SourceFilePath $file.FullName -GlobalDestinationPath $DestinationPath
     $zipFile = Join-Path $destinationDir ($file.BaseName + ".zip")
+    
     if (Test-Path $zipFile) {
         Write-Log "Zip file already exists, skipping: $zipFile" "WARNING"
         $filesSkipped += [PSCustomObject]@{
@@ -262,16 +293,19 @@ foreach ($file in $oldFiles) {
         }
         continue
     }
+    
     $totalOriginalSize += $file.Length
     $filesToArchive += [PSCustomObject]@{
         File = $file.FullName
         SizeMB = [math]::Round($file.Length / 1MB, 2)
     }
+    
     try {
         Compress-Archive -Path $file.FullName -DestinationPath $zipFile -Force -ErrorAction Stop
         $zipSize = (Get-Item $zipFile).Length
         $totalArchivedSize += $zipSize
         Write-Log "Archived: $($file.FullName) -> $zipFile"
+        
         if (-not $ArchiveOnly) {
             Remove-Item -Path $file.FullName -Force
             Write-Log "Deleted original: $($file.FullName)"
