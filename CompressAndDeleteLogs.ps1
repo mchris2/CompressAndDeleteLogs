@@ -1,35 +1,54 @@
 <#
 .SYNOPSIS
-    Compresses and deletes log files older than a specified number of days, preserving directory structure.
+    Compress and manage log files by archiving and optionally deleting them after a retention period.
 
 .DESCRIPTION
-    This script searches for log files older than a configurable retention period, compresses them into .zip archives,
-    and deletes the originals (unless -ArchiveOnly is specified). It logs all actions and errors to a specified log file.
-    By default, archived files are stored in an 'Archive' subfolder within the same directory as the source file.
+    This script searches for log files older than a specified retention period, compresses them into .zip archives,
+    and deletes the originals (unless -ArchiveOnly is specified). It supports NTFS decompression before deletion,
+    configurable archive retention, and robust logging to both file and Windows Event Log.
+    By default, archives are stored in an 'Archive' subfolder within each source folder, but a global destination can be specified.
+
+.AUTHOR
+    Chris McCorrin
+
+.VERSION
+    1.1.0
+
+.LICENCE
+    MIT Licence
+
+.LASTUPDATED
+    2025-06-03
 
 .PARAMETER SourcePath
-    The root directory to search for log files.
+    The root folder to search for log files.
 
 .PARAMETER DestinationPath
-    The root directory where compressed files will be stored. If not specified, uses 'Archive' subfolder in each source directory.
+    The root folder where compressed files will be stored. If not specified, uses an 'Archive' subfolder in each source folder.
 
 .PARAMETER LogFilePath
-    The path to the log file.
+    The path to the log file. Defaults to 'CompressAndDeleteLogs.log' in the script folder.
 
 .PARAMETER RetentionDays
     The number of days to retain log files before compressing and deleting.
+
+.PARAMETER ArchiveRetentionDays
+    The number of days to retain archived ZIP files before deleting them from the archive folder.
 
 .PARAMETER ArchiveOnly
     If set, archives logs but does not delete the originals.
 
 .PARAMETER DecompressBeforeDelete
-    If set, decompresses NTFS compressed files before deletion to free up the full logical size rather than just the compressed size.
+    If set, decompresses NTFS-compressed files before deletion to free up the full logical size.
 
 .EXAMPLE
     .\CompressAndDeleteLogs.ps1 -SourcePath "C:\inetpub\logs\LogFiles" -RetentionDays 30 -DecompressBeforeDelete
 
 .EXAMPLE
     .\CompressAndDeleteLogs.ps1 -SourcePath "C:\inetpub\logs\LogFiles" -DestinationPath "E:\Logs" -LogFilePath "D:\Scripts\CompressAndDeleteLogs.log" -RetentionDays 30
+
+.NOTES
+    v1.1.0 (2025-06-03): Major refactor with modular functions, improved logging, NTFS decompression support, archive retention, and robust error handling.
 #>
 
 param (
