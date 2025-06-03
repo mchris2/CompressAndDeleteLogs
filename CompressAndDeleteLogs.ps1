@@ -37,6 +37,7 @@ param (
     [string]$DestinationPath = "",
     [string]$LogFilePath = "$(Split-Path -Parent $MyInvocation.MyCommand.Path)\CompressAndDeleteLogs.log",
     [int]$RetentionDays = 30,
+    [int]$ArchiveRetentionDays = 90,
     [switch]$ArchiveOnly,
     [switch]$DecompressBeforeDelete
 )
@@ -182,7 +183,9 @@ function Write-LogArchiveSummary {
         $freeSpaceAfter,
         [int]$FailureCount,
         $JobErrors,
+        [long]$DeletedZipSize = 0,
         [switch]$ArchiveOnly
+
     )
     $totalOriginalLogicalSizeMB = [math]::Round($totalOriginalLogicalSize / 1MB, 2)
     $totalOriginalLogicalSizeGB = [math]::Round($totalOriginalLogicalSize / 1GB, 2)
@@ -190,7 +193,8 @@ function Write-LogArchiveSummary {
     $totalOriginalCompressedSizeGB = [math]::Round($totalOriginalCompressedSize / 1GB, 2)
     $totalArchivedSizeMB = [math]::Round($totalArchivedSize / 1MB, 2)
     $totalArchivedSizeGB = [math]::Round($totalArchivedSize / 1GB, 2)
-    
+    $deletedZipSizeMB = [math]::Round($DeletedZipSize / 1MB, 2)
+
     $spaceSavedFromLogicalMB = [math]::Round(($totalOriginalLogicalSize - $totalArchivedSize) / 1MB, 2)
     $spaceSavedFromLogicalGB = [math]::Round(($totalOriginalLogicalSize - $totalArchivedSize) / 1GB, 2)
     $spaceSavedFromCompressedMB = [math]::Round(($totalOriginalCompressedSize - $totalArchivedSize) / 1MB, 2)
@@ -225,6 +229,7 @@ function Write-LogArchiveSummary {
     $summaryLines += "Final ZIP archive size: $totalArchivedSizeMB MB ($totalArchivedSizeGB GB)"
     $summaryLines += "Space saved vs logical: $spaceSavedFromLogicalMB MB ($spaceSavedFromLogicalGB GB)"
     $summaryLines += "Space saved vs disk usage: $spaceSavedFromCompressedMB MB ($spaceSavedFromCompressedGB GB)"
+    $summaryLines += "Total size of deleted archived ZIP files: $deletedZipSizeMB MB"
     
     if ($null -ne $freeSpaceBefore) {
         $summaryLines += "Free space before: $([math]::Round($freeSpaceBefore / 1GB, 2)) GB"
@@ -504,7 +509,12 @@ foreach ($file in $oldFiles) {
     }
 
     try {
-        # Step 1: Decompress file in place if needed (for better ZIP compression)
+        # Before decompressing:
+        $sizeInfo = Get-FileActualSize -FilePath $file.FullName
+        $totalOriginalLogicalSize += $sizeInfo.LogicalSize
+        $totalOriginalCompressedSize += $sizeInfo.CompressedSize
+        
+        # Step 1: Decompress file in place if needed (for better ZIP compression and to free up logical size)
         $optimizeResult = Optimize-FileForArchiving -FilePath $file.FullName
         
         if (-not $optimizeResult.Success) {
@@ -540,20 +550,19 @@ foreach ($file in $oldFiles) {
             CompressionRatio = $compressionRatio
         }
         
-        $optimizationInfo = if ($optimizeResult.WasDecompressed) { " (decompressed in place for better ZIP compression)" } else { "" }
-        Write-Log "Archived: $($file.FullName) -> $zipFile (preserved timestamps)$optimizationInfo"
-        
+        $compressionRatio = if ($optimizeResult.FinalSize -gt 0) {
+            [math]::Round($zipSize / 1MB, 2).ToString() + "MB (" + [math]::Round(($zipSize / $optimizeResult.FinalSize) * 100, 1) + "%)"
+        } else {
+            [math]::Round($zipSize / 1MB, 2).ToString() + "MB"
+        }
+        Write-Log ("Archived: {0} -> {1} - Ratio: {2}" -f $file.FullName, $zipFile, $compressionRatio)
+
         if (-not $ArchiveOnly) {
-            # Step 3: Delete the original file (now decompressed if it was compressed)
             $spaceFreed = $optimizeResult.FinalSize
             Remove-Item -Path $file.FullName -Force
-            
-            $spaceInfo = if ($optimizeResult.WasDecompressed) { 
-                " (was decompressed, freed full logical size)" 
-            } else { 
-                "" 
-            }
-            Write-Log "Deleted original: $($file.FullName)$spaceInfo - Space freed: $([math]::Round($spaceFreed / 1MB, 2)) MB"
+
+            $decompText = if ($optimizeResult.WasDecompressed) { " (decompressed)" } else { "" }
+            Write-Log ("Deleted original: {0}{1} - Space freed: {2} MB" -f $file.FullName, $decompText, [math]::Round($spaceFreed / 1MB, 2))
         }
         
     } catch {
@@ -569,6 +578,34 @@ Write-Progress -Activity "Processing log files" -Status "Complete" -PercentCompl
 
 $freeSpaceAfter = Get-FreeSpace $SourcePath
 
+# --- Delete old ZIP files in Archive folders ---
+Write-Log "Checking for archived ZIP files older than $ArchiveRetentionDays days to delete..."
+
+$now = Get-Date
+$deletedArchives = 0
+$deletedZipSize = 0
+$archiveFolders = $uniqueDirs | Where-Object { $_ -match '\\Archive($|\\)' }
+
+foreach ($archiveFolder in $archiveFolders) {
+    if (Test-Path $archiveFolder) {
+        $oldZips = Get-ChildItem -Path $archiveFolder -Recurse -File -Filter *.zip | Where-Object {
+            $_.LastWriteTime -lt $now.AddDays(-$ArchiveRetentionDays)
+        }
+        foreach ($zip in $oldZips) {
+            $deletedZipSize += $zip.Length
+            try {
+                Remove-Item -Path $zip.FullName -Force
+                Write-Log "Deleted archived ZIP: $($zip.FullName) (older than $ArchiveRetentionDays days)"
+                $deletedArchives++
+            } catch {
+                Write-Log "Failed to delete archived ZIP: $($zip.FullName) - $($_.Exception.Message)" "WARNING"
+            }
+        }
+    }
+}
+
+Write-Log "Deleted $deletedArchives archived ZIP files older than $ArchiveRetentionDays days."
+
 Write-LogArchiveSummary -filesToArchive $filesToArchive `
     -filesSkipped $filesSkipped `
     -totalOriginalLogicalSize $totalOriginalLogicalSize `
@@ -578,6 +615,9 @@ Write-LogArchiveSummary -filesToArchive $filesToArchive `
     -freeSpaceAfter $freeSpaceAfter `
     -FailureCount $failureCount `
     -JobErrors $jobErrors `
-    -ArchiveOnly:$ArchiveOnly
+    -ArchiveOnly:$ArchiveOnly `
+    -DeletedZipSize $deletedZipSize
 
-Write-Log "Script completed."
+Write-Log "Script completed $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+Write-Log "=================================================================="
+Write-Log ""
